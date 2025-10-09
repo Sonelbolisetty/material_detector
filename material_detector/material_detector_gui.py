@@ -1,237 +1,217 @@
-"""
-Material Detector GUI App
-Detects material type: cardboard, metal, glass, paper, plastic, trash
-Features:
-- Detect image from file
-- Live camera prediction
-- Sustainability bars (Recyclability, Biodegradability, Eco-Friendliness)
-"""
-
-from PyQt5.QtGui import QPixmap
 import sys
 import os
-import time
 import cv2
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
 from PIL import Image
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
-    QHBoxLayout, QFileDialog, QProgressBar, QSizePolicy, QFrame
+    QApplication, QMainWindow, QLabel, QPushButton,
+    QFileDialog, QVBoxLayout, QWidget, QMessageBox, QProgressBar
 )
+from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtCore import QTimer
 
-# Classes
-CLASS_NAMES = ['cardboard', 'metal', 'glass', 'paper', 'plastic', 'trash']
+# ======================
+# Config
+# ======================
+CLASS_NAMES = ['cardboard', 'glass', 'metal', 'paper', 'plastic', 'trash']
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Sustainability Info
+SUSTAINABILITY = {
+    "cardboard": {"Recyclability": 90, "Biodegradability": 95, "Eco-Friendliness": 85,
+                  "Components": "Corrugated sheets, paper fibers"},
+    "glass": {"Recyclability": 99, "Biodegradability": 0, "Eco-Friendliness": 80,
+              "Components": "Silica, soda ash, limestone"},
+    "metal": {"Recyclability": 95, "Biodegradability": 0, "Eco-Friendliness": 75,
+              "Components": "Aluminum, steel, alloys"},
+    "paper": {"Recyclability": 85, "Biodegradability": 90, "Eco-Friendliness": 80,
+              "Components": "Wood pulp, fibers, cellulose"},
+    "plastic": {"Recyclability": 30, "Biodegradability": 10, "Eco-Friendliness": 25,
+                "Components": "PET, HDPE, polymers"},
+    "trash": {"Recyclability": 10, "Biodegradability": 20, "Eco-Friendliness": 15,
+              "Components": "Mixed waste, food scraps, non-recyclables"}
+}
 
-def heuristic_predict_pil(pil_img):
-    """
-    Simple heuristic classifier (fallback when no ML model is available).
-    """
-    img = np.array(pil_img.convert('RGB'))
-    small = cv2.resize(img, (224, 224))
-    hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+# ======================
+# Model
+# ======================
+class BetterCNN(nn.Module):
+    def __init__(self, num_classes=len(CLASS_NAMES)):
+        super(BetterCNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(128 * 28 * 28, 256), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
 
-    mean_rgb = small.mean(axis=(0, 1))
-    mean_hsv = hsv.mean(axis=(0, 1))
-    saturation = mean_hsv[1]
-    value = mean_hsv[2]
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        return self.classifier(x)
 
-    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
-    texture = np.std(lap)
+def load_model(path="material_model.pth"):
+    model = BetterCNN(num_classes=len(CLASS_NAMES)).to(device)
+    if os.path.exists(path):
+        model.load_state_dict(torch.load(path, map_location=device))
+        model.eval()
+        print("✅ Model loaded successfully")
+        return model
+    else:
+        print("⚠️ Model file not found.")
+        return None
 
-    # Heuristic rules
-    if value > 160 and texture < 10 and saturation < 70:
-        return 'glass', 0.72
-    if saturation < 50 and value > 120 and texture > 8:
-        return 'metal', 0.75
-    r, g, b = mean_rgb
-    if (r > g > b) and (texture > 6 and texture < 30) and (saturation > 40):
-        return 'cardboard', 0.7
-    if value > 180 and texture < 6 and saturation < 60:
-        return 'paper', 0.8
-    if saturation > 90 and texture < 40:
-        return 'plastic', 0.68
-    return 'trash', 0.55
+model = load_model()
 
+# Transform
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225]),
+])
 
-def sustainability_scores(material_label):
-    """
-    Map material to three scores (0–100).
-    """
-    mapping = {
-        'cardboard': (90, 85, 80),
-        'metal':    (95, 10, 75),
-        'glass':    (92, 40, 78),
-        'paper':    (88, 80, 82),
-        'plastic':  (30, 5, 25),
-        'trash':    (10, 2, 8)
-    }
-    return mapping.get(material_label, (20, 10, 15))
-
-
-class VideoThread(QThread):
-    frame_ready = pyqtSignal(np.ndarray, str, float)
-
-    def __init__(self, predictor_func, cam_index=0):
-        super().__init__()
-        self._run_flag = True
-        self.cap = cv2.VideoCapture(cam_index)
-        self.predictor = predictor_func
-
-    def run(self):
-        while self._run_flag and self.cap.isOpened():
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil = Image.fromarray(rgb)
-            label, conf = self.predictor(pil)
-            self.frame_ready.emit(rgb, label, conf)
-            time.sleep(0.03)
-        self.cap.release()
-
-    def stop(self):
-        self._run_flag = False
-        self.wait(2000)
-
-
+# ======================
+# GUI
+# ======================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Material Detector")
-        self.setGeometry(200, 100, 1100, 650)
-        self._init_ui()
-        self.video_thread = None
+        self.setWindowTitle("♻️ Material Detector")
+        self.setGeometry(200, 200, 600, 600)
 
-    def _init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
+        self.layout = QVBoxLayout()
 
-        # LEFT: Image/Video display
-        self.display_label = QLabel("No image loaded")
-        self.display_label.setAlignment(Qt.AlignCenter)
-        self.display_label.setFixedSize(720, 540)
-        self.display_label.setStyleSheet("background-color: #111; color: #ddd; border-radius: 6px;")
+        self.label = QLabel("Upload an image or start live detection", self)
+        self.layout.addWidget(self.label)
 
-        # RIGHT: Controls
-        self.pred_label = QLabel("Prediction: —")
-        self.pred_label.setFont(QFont("Arial", 14, QFont.Bold))
-        self.conf_label = QLabel("Confidence: —")
+        self.image_label = QLabel(self)
+        self.image_label.setFixedSize(400, 300)
+        self.layout.addWidget(self.image_label)
 
-        btn_load = QPushButton("Detect Image")
-        btn_load.clicked.connect(self.load_image)
+        # Buttons
+        self.upload_button = QPushButton("📂 Detect Image", self)
+        self.upload_button.clicked.connect(self.upload_image)
+        self.layout.addWidget(self.upload_button)
 
-        self.btn_camera = QPushButton("Start Live Camera")
-        self.btn_camera.setCheckable(True)
-        self.btn_camera.clicked.connect(self.toggle_camera)
+        self.live_button = QPushButton("🎥 Start Live Camera", self)
+        self.live_button.clicked.connect(self.toggle_camera)
+        self.layout.addWidget(self.live_button)
 
         # Sustainability bars
-        self.bar_recycle = QProgressBar()
-        self.bar_recycle.setMaximum(100)
-        self.bar_recycle.setFormat("Recyclability: %p%")
+        self.recycle_bar = QProgressBar(self); self.layout.addWidget(self.recycle_bar)
+        self.bio_bar = QProgressBar(self); self.layout.addWidget(self.bio_bar)
+        self.eco_bar = QProgressBar(self); self.layout.addWidget(self.eco_bar)
 
-        self.bar_biodeg = QProgressBar()
-        self.bar_biodeg.setMaximum(100)
-        self.bar_biodeg.setFormat("Biodegradability: %p%")
+        # Component info
+        self.component_label = QLabel("Components: -", self)
+        self.layout.addWidget(self.component_label)
 
-        self.bar_eco = QProgressBar()
-        self.bar_eco.setMaximum(100)
-        self.bar_eco.setFormat("Eco-Friendliness: %p%")
+        container = QWidget()
+        container.setLayout(self.layout)
+        self.setCentralWidget(container)
 
-        # RIGHT layout
-        right_layout = QVBoxLayout()
-        right_layout.addWidget(self.pred_label)
-        right_layout.addWidget(self.conf_label)
-        right_layout.addSpacing(8)
-        right_layout.addWidget(btn_load)
-        right_layout.addWidget(self.btn_camera)
-        right_layout.addSpacing(16)
-        right_layout.addWidget(QLabel("<b>Sustainability</b>"))
-        right_layout.addWidget(self.bar_recycle)
-        right_layout.addWidget(self.bar_biodeg)
-        right_layout.addWidget(self.bar_eco)
-        right_layout.addStretch(1)
+        # Timer for live camera
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
+        self.cap = None
 
-        frame = QFrame()
-        frame.setLayout(right_layout)
-        frame.setFixedWidth(320)
+    def upload_image(self):
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "Open Image", "", "Images (*.png *.jpg *.jpeg)"
+        )
+        if file_name:
+            pixmap = QPixmap(file_name)
+            self.image_label.setPixmap(pixmap.scaled(
+                self.image_label.width(), self.image_label.height()
+            ))
+            self.predict_image(file_name)
 
-        main_layout = QHBoxLayout()
-        main_layout.addWidget(self.display_label)
-        main_layout.addWidget(frame)
-        central.setLayout(main_layout)
-
-    def load_image(self):
-        fname, _ = QFileDialog.getOpenFileName(self, 'Open image', os.getcwd(),
-                                               "Image files (*.jpg *.jpeg *.png *.bmp)")
-        if not fname:
+    def predict_image(self, image_path):
+        if model is None:
+            QMessageBox.warning(self, "Error", "Model not loaded.")
             return
-        pil = Image.open(fname).convert('RGB')
-        self.show_image(pil)
-        label, conf = heuristic_predict_pil(pil)
-        self.update_prediction(label, conf)
 
-    def show_image(self, pil_img):
-        qimg = pil_to_qimage(pil_img)
-        pix = QPixmap.fromImage(qimg).scaled(
-            self.display_label.width(), self.display_label.height(),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self.display_label.setPixmap(pix)
+        image = Image.open(image_path).convert("RGB")
+        image = transform(image).unsqueeze(0).to(device)
 
-    def update_prediction(self, label, conf):
-        self.pred_label.setText(f"Prediction: {label}")
-        self.conf_label.setText(f"Confidence: {conf*100:.1f}%")
-        r, b, e = sustainability_scores(label)
-        self.bar_recycle.setValue(int(r))
-        self.bar_biodeg.setValue(int(b))
-        self.bar_eco.setValue(int(e))
+        with torch.no_grad():
+            outputs = model(image)
+            probs = F.softmax(outputs, dim=1)
+            confidence, predicted = torch.max(probs, 1)
+            predicted_class = CLASS_NAMES[predicted.item()]
+            confidence = confidence.item() * 100
 
-    def toggle_camera(self, checked):
-        if checked:
-            self.btn_camera.setText("Stop Live Camera")
-            self.video_thread = VideoThread(predictor_func=heuristic_predict_pil, cam_index=0)
-            self.video_thread.frame_ready.connect(self.on_frame)
-            self.video_thread.start()
+        self.label.setText(f"Prediction: {predicted_class} ({confidence:.1f}%)")
+        self.update_sustainability(predicted_class)
+
+    def update_sustainability(self, material):
+        info = SUSTAINABILITY.get(material, {})
+        self.recycle_bar.setValue(info.get("Recyclability", 0))
+        self.recycle_bar.setFormat(f"Recyclability: {info.get('Recyclability', 0)}%")
+
+        self.bio_bar.setValue(info.get("Biodegradability", 0))
+        self.bio_bar.setFormat(f"Biodegradability: {info.get('Biodegradability', 0)}%")
+
+        self.eco_bar.setValue(info.get("Eco-Friendliness", 0))
+        self.eco_bar.setFormat(f"Eco-Friendliness: {info.get('Eco-Friendliness', 0)}%")
+
+        self.component_label.setText(f"Components: {info.get('Components', '-')}")
+
+
+    # ======================
+    # Live Camera
+    # ======================
+    def toggle_camera(self):
+        if self.cap is None:
+            self.cap = cv2.VideoCapture(0)
+            self.timer.start(30)
+            self.live_button.setText("⏹ Stop Live Camera")
         else:
-            self.btn_camera.setText("Start Live Camera")
-            if self.video_thread:
-                self.video_thread.stop()
-                self.video_thread = None
+            self.timer.stop()
+            self.cap.release()
+            self.cap = None
+            self.live_button.setText("🎥 Start Live Camera")
 
-    def on_frame(self, rgb_frame, label, conf):
-        h, w, _ = rgb_frame.shape
-        qimg = QImage(rgb_frame.data, w, h, 3*w, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg).scaled(
-            self.display_label.width(), self.display_label.height(),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self.display_label.setPixmap(pix)
-        self.update_prediction(label, conf)
+    def update_frame(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return
 
-    def closeEvent(self, event):
-        if self.video_thread:
-            self.video_thread.stop()
-        event.accept()
+        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        self.image_label.setPixmap(QPixmap.fromImage(qt_image).scaled(
+            self.image_label.width(), self.image_label.height()
+        ))
+
+        # Prediction
+        image = Image.fromarray(rgb_image).convert("RGB")
+        image = transform(image).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            outputs = model(image)
+            probs = F.softmax(outputs, dim=1)
+            confidence, predicted = torch.max(probs, 1)
+            predicted_class = CLASS_NAMES[predicted.item()]
+            confidence = confidence.item() * 100
+
+        self.label.setText(f"Prediction: {predicted_class} ({confidence:.1f}%)")
+        self.update_sustainability(predicted_class)
 
 
-def pil_to_qimage(pil_img):
-    rgb = pil_img.convert('RGB')
-    arr = np.array(rgb)
-    h, w, ch = arr.shape
-    bytes_per_line = ch * w
-    return QImage(arr.data, w, h, bytes_per_line, QImage.Format_RGB888)
-
-
-def main():
+# ======================
+# Run App
+# ======================
+if __name__ == "__main__":
     app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec_())
-
-
-if __name__ == '__main__':
-    main()
